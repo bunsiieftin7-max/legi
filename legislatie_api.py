@@ -11,7 +11,14 @@ Configuration via env:
  - TOKEN_LIFETIME (seconds, default 3600)
  - DEBUG (True/False)
 """
-
+# Fix pour Python 3.13+ (module cgi supprimé mais requis par zeep)
+import sys
+if sys.version_info >= (3, 13):
+    import html
+    sys.modules['cgi'] = type(sys)('cgi')
+    sys.modules['cgi'].escape = html.escape
+ """
+ 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
