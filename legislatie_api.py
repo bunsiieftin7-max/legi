@@ -11,19 +11,40 @@ Configuration via env:
  - TOKEN_LIFETIME (seconds, default 3600)
  - DEBUG (True/False)
 """
-# Fix pour Python 3.13+ (module cgi supprimé mais requis par zeep)
-import sys
-if sys.version_info >= (3, 13):
-    import html
-    sys.modules['cgi'] = type(sys)('cgi')
-    sys.modules['cgi'].escape = html.escape
- 
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import logging
 from datetime import datetime, timedelta
 import threading
+
+# Fix pour Python 3.13+ (module cgi supprimé mais requis par zeep)
+import sys
+if sys.version_info >= (3, 13):
+    import html
+    import types
+    # créer un module minimal 'cgi' pour compatibilité avec zeep
+    _cgi_shim = types.ModuleType("cgi")
+    # fournir html.escape comme fallback pour cgi.escape (si utilisé)
+    _cgi_shim.escape = html.escape
+    # fournir parse_header minimale (utilisée par zeep.utils)
+    def _parse_header(value):
+        if not value:
+            return "", {}
+        parts = [p.strip() for p in value.split(";")]
+        main = parts[0]
+        params = {}
+        for p in parts[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                v = v.strip()
+                if v.startswith('"') and v.endswith('"'):
+                    v = v[1:-1]
+                params[k.strip()] = v
+        return main, params
+    _cgi_shim.parse_header = _parse_header
+    sys.modules["cgi"] = _cgi_shim
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -252,7 +273,6 @@ def search():
         })
     except Exception as e:
         logger.exception("Erreur /search")
-        # If SOAP Fault exists, zeep raises a Fault — let it surface as detail
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -292,7 +312,6 @@ def get_main_codes():
                     })
             except Exception as e:
                 logger.warning("Erreur pour code %s : %s", code["name"], e)
-                # continue to next code
 
         return jsonify({
             "success": True,
