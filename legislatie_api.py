@@ -55,7 +55,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Configuration (env overrides)
-WSDL_URL = os.environ.get("WSDL_URL", "http://legislatie.just.ro/apiws/FreeWebService.svc?wsdl")
+WSDL_URL = os.environ.get("WSDL_URL", "https://legislatie.just.ro/apiws/FreeWebService.svc?wsdl")
 TOKEN_LIFETIME = int(os.environ.get("TOKEN_LIFETIME", str(3600)))  # seconds
 DEBUG = os.environ.get("DEBUG", "False").lower() in ("1", "true", "yes")
 
