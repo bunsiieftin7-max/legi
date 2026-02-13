@@ -1,6 +1,6 @@
 """
 API REST pour accéder à legislatie.just.ro
-Version corrigée - utilise requests au lieu de zeep pour éviter les problèmes de namespace
+Version 3.1 - Gestion des tokens expirés
 """
 
 from flask import Flask, request, jsonify
@@ -12,33 +12,47 @@ from datetime import datetime, timedelta
 import threading
 import requests
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("legislatie_api")
 
-# App
 app = Flask(__name__)
 CORS(app)
 
-# Configuration
 SOAP_URL = os.environ.get("SOAP_URL", "https://legislatie.just.ro/apiws/FreeWebService.svc/SOAP")
 TOKEN_LIFETIME = int(os.environ.get("TOKEN_LIFETIME", "3600"))
-DEBUG = os.environ.get("DEBUG", "False").lower() in ("1", "true", "yes")
 
-# Token cache
 _token_cache = {"token": None, "expires_at": None}
 _token_lock = threading.Lock()
 
 
+def get_new_token():
+    """Force l'obtention d'un nouveau token"""
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction": "http://tempuri.org/IFreeWebService/GetToken"
+    }
+    body = '<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetToken xmlns="http://tempuri.org/" /></soap:Body></soap:Envelope>'
+    
+    response = requests.post(SOAP_URL, headers=headers, data=body, timeout=30)
+    
+    if response.status_code != 200:
+        raise Exception(f"Erreur SOAP GetToken: {response.status_code}")
+    
+    match = re.search(r'<GetTokenResult>([^<]+)</GetTokenResult>', response.text)
+    if not match:
+        raise Exception("Token non trouvé")
+    
+    token = match.group(1).strip()
+    
+    with _token_lock:
+        _token_cache["token"] = token
+        _token_cache["expires_at"] = datetime.utcnow() + timedelta(seconds=TOKEN_LIFETIME)
+    
+    return token
+
+
 def get_cached_token():
-    """Obtient un token (avec cache)"""
-    token = _token_cache.get("token")
-    expires_at = _token_cache.get("expires_at")
-    
-    if token and expires_at and expires_at > datetime.utcnow():
-        logger.debug("Token depuis le cache")
-        return token, True
-    
+    """Obtient le token en cache ou un nouveau"""
     with _token_lock:
         token = _token_cache.get("token")
         expires_at = _token_cache.get("expires_at")
@@ -46,47 +60,27 @@ def get_cached_token():
         if token and expires_at and expires_at > datetime.utcnow():
             return token, True
         
-        # Obtenir nouveau token
-        try:
-            headers = {
-                "Content-Type": "text/xml; charset=utf-8",
-                "SOAPAction": "http://tempuri.org/IFreeWebService/GetToken"
-            }
-            body = '<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetToken xmlns="http://tempuri.org/" /></soap:Body></soap:Envelope>'
-            
-            response = requests.post(SOAP_URL, headers=headers, data=body, timeout=30)
-            
-            if response.status_code != 200:
-                raise Exception(f"Erreur SOAP GetToken: {response.status_code}")
-            
-            # Extraire le token
-            match = re.search(r'<GetTokenResult>([^<]+)</GetTokenResult>', response.text)
-            if not match:
-                raise Exception("Token non trouvé dans la réponse")
-            
-            token = match.group(1).strip()
-            _token_cache["token"] = token
-            _token_cache["expires_at"] = datetime.utcnow() + timedelta(seconds=TOKEN_LIFETIME)
-            
-            logger.info("Nouveau token obtenu")
-            return token, False
-            
-        except Exception as e:
-            logger.error(f"Erreur get token: {e}")
-            raise
+    # Obtenir nouveau token
+    token = get_new_token()
+    return token, False
+
+
+def invalidate_token():
+    """Invalide le token en cache"""
+    with _token_lock:
+        _token_cache["token"] = None
+        _token_cache["expires_at"] = None
+    logger.info("Token invalidé")
 
 
 def extract_tag(xml, tag):
-    """Extrait le contenu d'une balise XML"""
     pattern = rf'<a:{tag}>(.*?)</a:{tag}>'
     match = re.search(pattern, xml, re.DOTALL | re.IGNORECASE)
     return match.group(1).strip() if match else ""
 
 
-def format_lege_from_xml(xml_content):
-    """Formate un document légal depuis le XML"""
+def format_lege(xml_content):
     link = extract_tag(xml_content, 'LinkHtml')
-    
     return {
         "id": link.split('/')[-1] if link else "",
         "title": extract_tag(xml_content, 'Titlu'),
@@ -101,88 +95,20 @@ def format_lege_from_xml(xml_content):
     }
 
 
-@app.route("/", methods=["GET"])
-def index():
-    """Documentation"""
-    return jsonify({
-        "service": "Legislatie.just.ro API Proxy",
-        "version": "3.0",
-        "description": "Proxy REST pour le service SOAP legislatie.just.ro",
-        "endpoints": {
-            "GET /health": "Vérifier l'état du service",
-            "GET /token": "Obtenir un token (mis en cache)",
-            "GET /search": "Rechercher dans la législation"
-        },
-        "search_params": {
-            "title": "Titre de la loi (ex: Codul civil)",
-            "year": "Année (ex: 2009)",
-            "number": "Numéro",
-            "text": "Texte à rechercher",
-            "page": "Numéro de page (défaut: 0)",
-            "per_page": "Résultats par page (défaut: 10, max: 100)"
-        },
-        "example": {
-            "search_civil_code": "/search?title=Codul civil&per_page=5",
-            "search_by_year": "/search?year=2009"
-        }
-    })
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    """Health check"""
-    try:
-        token, _ = get_cached_token()
-        return jsonify({
-            "status": "healthy",
-            "soap_url": SOAP_URL,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
-        }), 500
-
-
-@app.route("/token", methods=["GET"])
-def token_endpoint():
-    """Endpoint pour obtenir le token"""
-    try:
-        token, cached = get_cached_token()
-        return jsonify({
-            "success": True,
-            "token": token,
-            "cached": cached
-        })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/search", methods=["GET"])
-def search():
-    """Recherche dans la législation"""
-    try:
-        token, _ = get_cached_token()
-        
-        page = int(request.args.get("page", 0))
-        per_page = min(int(request.args.get("per_page", 10)), 100)
-        
-        # Construire le XML de recherche
-        search_params = f"<a:NumarPagina>{page}</a:NumarPagina><a:RezultatePagina>{per_page}</a:RezultatePagina>"
-        
-        if request.args.get("title"):
-            search_params += f"<a:SearchTitlu>{request.args.get('title')}</a:SearchTitlu>"
-        if request.args.get("year"):
-            search_params += f"<a:SearchAn>{request.args.get('year')}</a:SearchAn>"
-        if request.args.get("number"):
-            search_params += f"<a:SearchNumar>{request.args.get('number')}</a:SearchNumar>"
-        if request.args.get("text"):
-            search_params += f"<a:SearchText>{request.args.get('text')}</a:SearchText>"
-        
-        # Corps SOAP
-        body = f'''<?xml version="1.0" encoding="utf-8"?>
+def do_search(token, page, per_page, title=None, year=None, number=None, text=None):
+    """Effectue une recherche avec un token donné"""
+    search_params = f"<a:NumarPagina>{page}</a:NumarPagina><a:RezultatePagina>{per_page}</a:RezultatePagina>"
+    
+    if title:
+        search_params += f"<a:SearchTitlu>{title}</a:SearchTitlu>"
+    if year:
+        search_params += f"<a:SearchAn>{year}</a:SearchAn>"
+    if number:
+        search_params += f"<a:SearchNumar>{number}</a:SearchNumar>"
+    if text:
+        search_params += f"<a:SearchText>{text}</a:SearchText>"
+    
+    body = f'''<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
     <Search xmlns="http://tempuri.org/">
@@ -193,41 +119,77 @@ def search():
     </Search>
   </soap:Body>
 </soap:Envelope>'''
-        
-        headers = {
-            "Content-Type": "text/xml; charset=utf-8",
-            "SOAPAction": "http://tempuri.org/IFreeWebService/Search"
+    
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction": "http://tempuri.org/IFreeWebService/Search"
+    }
+    
+    response = requests.post(SOAP_URL, headers=headers, data=body, timeout=180)
+    return response
+
+
+@app.route("/")
+def index():
+    return jsonify({
+        "service": "Legislatie.just.ro API Proxy",
+        "version": "3.1",
+        "endpoints": {
+            "GET /health": "Health check",
+            "GET /token": "Get token",
+            "GET /search": "Search legislation"
         }
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
+
+
+@app.route("/token")
+def token_endpoint():
+    try:
+        token, cached = get_cached_token()
+        return jsonify({"success": True, "token": token, "cached": cached})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/search")
+def search():
+    """Recherche avec retry automatique si token expiré"""
+    try:
+        page = int(request.args.get("page", 0))
+        per_page = min(int(request.args.get("per_page", 10)), 100)
+        title = request.args.get("title")
+        year = request.args.get("year")
+        number = request.args.get("number")
+        text = request.args.get("text")
         
-        logger.info(f"Recherche: title={request.args.get('title')}, page={page}")
+        # Premier essai avec token en cache
+        token, was_cached = get_cached_token()
+        response = do_search(token, page, per_page, title, year, number, text)
         
-        response = requests.post(SOAP_URL, headers=headers, data=body, timeout=180)
+        # Si erreur 500 et token était en cache, réessayer avec nouveau token
+        if response.status_code == 500 and was_cached:
+            logger.warning("Token expiré, récupération nouveau token...")
+            invalidate_token()
+            token, _ = get_cached_token()
+            response = do_search(token, page, per_page, title, year, number, text)
         
         if response.status_code != 200:
-            return jsonify({
-                "success": False,
-                "error": f"Erreur SOAP Search: {response.status_code}"
-            }), 500
+            return jsonify({"success": False, "error": f"Erreur SOAP Search: {response.status_code}"}), 500
         
-        # Parser les résultats
         results = []
-        pattern = r'<a:Legi>(.*?)</a:Legi>'
-        matches = re.findall(pattern, response.text, re.DOTALL)
-        
-        for match in matches:
-            results.append(format_lege_from_xml(match))
+        for match in re.findall(r'<a:Legi>(.*?)</a:Legi>', response.text, re.DOTALL):
+            results.append(format_lege(match))
         
         return jsonify({
             "success": True,
             "total": len(results),
             "page": page,
             "per_page": per_page,
-            "query": {
-                "title": request.args.get("title"),
-                "year": request.args.get("year"),
-                "number": request.args.get("number"),
-                "text": request.args.get("text")
-            },
             "results": results
         })
         
@@ -236,77 +198,5 @@ def search():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route("/codes", methods=["GET"])
-def get_main_codes():
-    """Codes juridiques principaux"""
-    base_codes = [
-        {"name": "Codul civil", "year": 2009},
-        {"name": "Codul penal", "year": 2009},
-        {"name": "Codul de procedură civilă", "year": 2010},
-        {"name": "Codul de procedură penală", "year": 2010},
-        {"name": "Codul muncii", "year": 2003},
-        {"name": "Codul fiscal", "year": 2015},
-    ]
-    
-    try:
-        token, _ = get_cached_token()
-        results = []
-        
-        for code in base_codes:
-            try:
-                body = f'''<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <Search xmlns="http://tempuri.org/">
-      <SearchModel xmlns:a="http://schemas.datacontract.org/2004/07/FreeWebService">
-        <a:NumarPagina>0</a:NumarPagina>
-        <a:RezultatePagina>1</a:RezultatePagina>
-        <a:SearchTitlu>{code['name']}</a:SearchTitlu>
-        <a:SearchAn>{code['year']}</a:SearchAn>
-      </SearchModel>
-      <tokenKey>{token}</tokenKey>
-    </Search>
-  </soap:Body>
-</soap:Envelope>'''
-                
-                headers = {
-                    "Content-Type": "text/xml; charset=utf-8",
-                    "SOAPAction": "http://tempuri.org/IFreeWebService/Search"
-                }
-                
-                response = requests.post(SOAP_URL, headers=headers, data=body, timeout=180)
-                
-                if response.status_code == 200:
-                    pattern = r'<a:Legi>(.*?)</a:Legi>'
-                    matches = re.findall(pattern, response.text, re.DOTALL)
-                    
-                    if matches:
-                        results.append({
-                            "code_name": code["name"],
-                            "details": format_lege_from_xml(matches[0])
-                        })
-            except Exception as e:
-                logger.warning(f"Erreur pour {code['name']}: {e}")
-        
-        return jsonify({
-            "success": True,
-            "total": len(results),
-            "codes": results
-        })
-        
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/document/<doc_id>", methods=["GET"])
-def get_document(doc_id):
-    """Lien vers un document"""
-    return jsonify({
-        "success": True,
-        "url": f"https://legislatie.just.ro/Public/DetaliiDocument/{doc_id}"
-    })
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=DEBUG)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
