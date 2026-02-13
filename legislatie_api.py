@@ -1,6 +1,6 @@
 """
 API REST pour accéder à legislatie.just.ro
-Version 3.1 - Gestion des tokens expirés
+Version 3.2 - Support complet des filtres de recherche
 """
 
 from flask import Flask, request, jsonify
@@ -95,10 +95,11 @@ def format_lege(xml_content):
     }
 
 
-def do_search(token, page, per_page, title=None, year=None, number=None, text=None):
-    """Effectue une recherche avec un token donné"""
+def do_search(token, page, per_page, title=None, year=None, number=None, text=None, tip_act=None):
+    """Effectue une recherche avec un token donné - SUPPORT COMPLET DES FILTRES"""
     search_params = f"<a:NumarPagina>{page}</a:NumarPagina><a:RezultatePagina>{per_page}</a:RezultatePagina>"
     
+    # Ajouter tous les filtres disponibles
     if title:
         search_params += f"<a:SearchTitlu>{title}</a:SearchTitlu>"
     if year:
@@ -107,6 +108,10 @@ def do_search(token, page, per_page, title=None, year=None, number=None, text=No
         search_params += f"<a:SearchNumar>{number}</a:SearchNumar>"
     if text:
         search_params += f"<a:SearchText>{text}</a:SearchText>"
+    if tip_act:  # NOUVEAU : filtre par type d'acte
+        search_params += f"<a:SearchTipAct>{tip_act}</a:SearchTipAct>"
+    
+    logger.info(f"Paramètres de recherche: page={page}, per_page={per_page}, title={title}, year={year}, tip_act={tip_act}, text={text[:50] if text else None}...")
     
     body = f'''<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -126,6 +131,13 @@ def do_search(token, page, per_page, title=None, year=None, number=None, text=No
     }
     
     response = requests.post(SOAP_URL, headers=headers, data=body, timeout=180)
+    
+    # Log pour debug
+    if response.status_code != 200:
+        logger.error(f"Erreur SOAP: {response.status_code}")
+    else:
+        logger.info(f"Réponse SOAP reçue, taille: {len(response.text)} caractères")
+    
     return response
 
 
@@ -133,12 +145,13 @@ def do_search(token, page, per_page, title=None, year=None, number=None, text=No
 def index():
     return jsonify({
         "service": "Legislatie.just.ro API Proxy",
-        "version": "3.1",
+        "version": "3.2 - Support complet des filtres",
         "endpoints": {
             "GET /health": "Health check",
             "GET /token": "Get token",
-            "GET /search": "Search legislation"
-        }
+            "GET /search": "Search legislation with filters"
+        },
+        "filters_supported": ["title", "text", "year", "number", "tip_act", "page", "per_page"]
     })
 
 
@@ -158,38 +171,59 @@ def token_endpoint():
 
 @app.route("/search")
 def search():
-    """Recherche avec retry automatique si token expiré"""
+    """Recherche avec support complet des filtres"""
     try:
+        # Récupérer tous les paramètres
         page = int(request.args.get("page", 0))
         per_page = min(int(request.args.get("per_page", 10)), 100)
         title = request.args.get("title")
         year = request.args.get("year")
         number = request.args.get("number")
         text = request.args.get("text")
+        tip_act = request.args.get("tip_act")  # NOUVEAU : filtre par type d'acte
+        
+        # Log de la requête reçue
+        logger.info(f"Requête reçue: page={page}, per_page={per_page}, title={title}, year={year}, tip_act={tip_act}, text={text[:50] if text else None}")
         
         # Premier essai avec token en cache
         token, was_cached = get_cached_token()
-        response = do_search(token, page, per_page, title, year, number, text)
+        response = do_search(token, page, per_page, title, year, number, text, tip_act)
         
         # Si erreur 500 et token était en cache, réessayer avec nouveau token
         if response.status_code == 500 and was_cached:
             logger.warning("Token expiré, récupération nouveau token...")
             invalidate_token()
             token, _ = get_cached_token()
-            response = do_search(token, page, per_page, title, year, number, text)
+            response = do_search(token, page, per_page, title, year, number, text, tip_act)
         
         if response.status_code != 200:
-            return jsonify({"success": False, "error": f"Erreur SOAP Search: {response.status_code}"}), 500
+            return jsonify({
+                "success": False, 
+                "error": f"Erreur SOAP Search: {response.status_code}",
+                "details": response.text[:500] if response.text else "Pas de détails"
+            }), 500
         
+        # Extraire les résultats
         results = []
-        for match in re.findall(r'<a:Legi>(.*?)</a:Legi>', response.text, re.DOTALL):
+        matches = re.findall(r'<a:Legi>(.*?)</a:Legi>', response.text, re.DOTALL)
+        
+        for match in matches:
             results.append(format_lege(match))
+        
+        logger.info(f"{len(results)} résultats trouvés")
         
         return jsonify({
             "success": True,
             "total": len(results),
             "page": page,
             "per_page": per_page,
+            "filters_applied": {
+                "title": title,
+                "text": text[:50] + "..." if text and len(text) > 50 else text,
+                "year": year,
+                "number": number,
+                "tip_act": tip_act
+            },
             "results": results
         })
         
@@ -199,4 +233,4 @@ def search():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
